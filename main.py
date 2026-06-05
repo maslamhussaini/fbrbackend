@@ -1,12 +1,9 @@
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from routes.invoices import router as invoice_router
+from routes.settings import router as settings_router
 
-app = FastAPI(
-    title="FBR Digital Invoicing API",
-    version="2.0.0",
-    description="FBR e-invoicing backend — correct API structure"
-)
+app = FastAPI(title="FBR Digital Invoicing API", version="2.0.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -17,6 +14,7 @@ app.add_middleware(
 )
 
 app.include_router(invoice_router)
+app.include_router(settings_router)
 
 
 @app.get("/")
@@ -26,14 +24,9 @@ def health():
 
 @app.get("/ping-fbr")
 async def ping_fbr():
-    """
-    Test FBR sandbox with a real working payload (SN001 — standard rate).
-    Uses validate endpoint so nothing is actually submitted.
-    """
     import httpx
     from config import settings
 
-    # Exact payload structure from confirmed working integration
     test_payload = {
         "invoiceType": "Sale Invoice",
         "invoiceDate": "2025-07-12",
@@ -44,7 +37,7 @@ async def ping_fbr():
         "buyerNTNCNIC": "8352312-6",
         "buyerBusinessName": "AADAM TEXTILE",
         "buyerProvince": "SINDH",
-        "buyerAddress": "PLOT NO CR-435, SECTOR 16-B, F.B AREA, KARACHI",
+        "buyerAddress": "PLOT NO CR-435, KARACHI",
         "buyerRegistrationType": "Registered",
         "invoiceRefNo": "667",
         "scenarioId": "SN001",
@@ -69,15 +62,11 @@ async def ping_fbr():
         }]
     }
 
-    token = settings.FBR_BEARER_TOKEN or "YOUR_TOKEN_HERE"
-    headers = {
-        "Authorization": f"Bearer {token}",
-        "Content-Type": "application/json"
-    }
+    token = settings.FBR_BEARER_TOKEN or "no-token-set"
+    headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
 
     try:
         async with httpx.AsyncClient(verify=False, timeout=30) as client:
-            # Use validate endpoint — safe, no actual submission
             r = await client.post(settings.FBR_VALIDATE_URL, json=test_payload, headers=headers)
         data = r.json()
         status = data.get("validationResponse", {}).get("statusCode")
