@@ -2,15 +2,10 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from routes.invoices import router as invoice_router
 from routes.settings import router as settings_router
-<<<<<<< HEAD
 from routes.auth     import router as auth_router
 from routes.bulk     import router as bulk_router
 
 app = FastAPI(title="FBR Digital Invoicing API", version="3.0.0")
-=======
-
-app = FastAPI(title="FBR Digital Invoicing API", version="2.0.0")
->>>>>>> 6d2a26dab7406daea78dc1d78fcb75538270d7bb
 
 app.add_middleware(
     CORSMiddleware,
@@ -20,7 +15,6 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-<<<<<<< HEAD
 app.include_router(auth_router)
 app.include_router(invoice_router)
 app.include_router(settings_router)
@@ -29,73 +23,6 @@ app.include_router(bulk_router)
 @app.get("/")
 def health():
     return {"status": "ok", "version": "3.0.0"}
-=======
-app.include_router(invoice_router)
-app.include_router(settings_router)
-
-
-@app.get("/")
-def health():
-    return {"status": "ok", "version": "2.0.0"}
-
-
-@app.get("/ping-fbr")
-async def ping_fbr():
-    import httpx
-    from config import settings
-
-    test_payload = {
-        "invoiceType": "Sale Invoice",
-        "invoiceDate": "2025-07-12",
-        "sellerNTNCNIC": "4250124272389",
-        "sellerBusinessName": "FAIZAN ENGINEERING SERVICES",
-        "sellerProvince": "SINDH",
-        "sellerAddress": "KARACHI",
-        "buyerNTNCNIC": "8352312-6",
-        "buyerBusinessName": "AADAM TEXTILE",
-        "buyerProvince": "SINDH",
-        "buyerAddress": "PLOT NO CR-435, KARACHI",
-        "buyerRegistrationType": "Registered",
-        "invoiceRefNo": "667",
-        "scenarioId": "SN001",
-        "items": [{
-            "hsCode": "3923.9090",
-            "productDescription": "Test Product",
-            "rate": "18%",
-            "uoM": "KG",
-            "quantity": 1,
-            "totalValues": 0,
-            "valueSalesExcludingST": 1,
-            "fixedNotifiedValueOrRetailPrice": 0,
-            "salesTaxApplicable": 0.18,
-            "salesTaxWithheldAtSource": 0,
-            "extraTax": 0,
-            "furtherTax": 0,
-            "sroScheduleNo": "",
-            "fedPayable": 0,
-            "discount": 0,
-            "saleType": "Goods at standard rate (default)",
-            "sroItemSerialNo": ""
-        }]
-    }
-
-    token = settings.FBR_BEARER_TOKEN or "no-token-set"
-    headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
-
-    try:
-        async with httpx.AsyncClient(verify=False, timeout=30) as client:
-            r = await client.post(settings.FBR_VALIDATE_URL, json=test_payload, headers=headers)
-        data = r.json()
-        status = data.get("validationResponse", {}).get("statusCode")
-        return {
-            "fbr_status": "VALID ✓" if status == "00" else "INVALID ✗",
-            "status_code": status,
-            "full_response": data
-        }
-    except Exception as e:
-        return {"status": "error", "detail": str(e)}
-
->>>>>>> 6d2a26dab7406daea78dc1d78fcb75538270d7bb
 
 if __name__ == "__main__":
     import uvicorn
