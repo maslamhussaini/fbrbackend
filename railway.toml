@@ -5,4 +5,8 @@ dockerfilePath = "Dockerfile"
 [deploy]
 startCommand = "/bin/sh -c \"exec uvicorn main:app --host 0.0.0.0 --port $PORT\""
 restartPolicyType = "on_failure"
+<<<<<<< HEAD
 restartPolicyMaxRetries = 3
+=======
+restartPolicyMaxRetries = 3
+>>>>>>> 6d2a26dab7406daea78dc1d78fcb75538270d7bb
