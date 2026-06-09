@@ -80,6 +80,31 @@ def build_payload_from_row(row_data: dict, tenant: dict, tenant_id: str) -> tupl
     """
     errors = []
 
+    # ── Normalize column names — map template headers to internal keys ────────
+    ALIASES = {
+        "invoice date":           "invoice_date",
+        "invoice ref no":         "invoice_ref_no",
+        "buyer ntn/cnic":         "buyer_ntn",
+        "buyer name":             "buyer_name",
+        "buyer province":         "buyer_province",
+        "buyer address":          "buyer_address",
+        "buyer registration":     "buyer_registration_type",
+        "buyer registration type":"buyer_registration_type",
+        "hs code":                "hs_code",
+        "product description":    "product_description",
+        "uom":                    "uom",
+        "quantity":               "quantity",
+        "value excl st":          "value_excl_st",
+        "sales tax":              "sales_tax",
+        "rate":                   "rate",
+        "sale type":              "sale_type",
+        "sro schedule no":        "sro_schedule_no",
+        "sro item serial no":     "sro_item_serial",
+        "further tax":            "further_tax_amt",
+        "retail price":           "retail_price",
+    }
+    row_data = {ALIASES.get(k, k): v for k, v in row_data.items()}
+
     # Resolve customer
     buyer_id = row_data.get("buyer_ntn") or row_data.get("buyer_name") or ""
     customer = get_customer(tenant_id, buyer_id)
@@ -222,36 +247,54 @@ def parse_bulk_excel(file_bytes: bytes) -> dict:
         results["errors"].append("Could not open file")
         return results
 
-    # ── Invoices sheet ────────────────────────────────────────────────────────
-    if "Invoices" in wb.sheetnames:
-        ws = wb["Invoices"]
-        headers = [str(c.value or "").strip().lower() for c in next(ws.iter_rows(min_row=1, max_row=1))]
+    def _find_sheet(names: list) -> object:
+        """Find sheet by any of the given names (case-insensitive)."""
+        for name in names:
+            for sname in wb.sheetnames:
+                if sname.lower() == name.lower():
+                    return wb[sname]
+        return None
 
+    def _read_sheet(ws) -> list:
+        rows_out = []
+        if not ws:
+            return rows_out
+        headers = [str(c.value or "").strip().lower()
+                   for c in next(ws.iter_rows(min_row=1, max_row=1))]
         for row_idx, row in enumerate(ws.iter_rows(min_row=2, values_only=True), 2):
             if not any(row):
                 continue
-            row_data = {headers[i]: row[i] for i in range(len(headers)) if i < len(row)}
-            results["invoices"].append({"row": row_idx, "data": row_data})
+            row_data = {headers[i]: row[i]
+                        for i in range(len(headers)) if i < len(row)}
+            rows_out.append({"row": row_idx, "data": row_data})
+        return rows_out
+
+    def _read_sheet_plain(ws) -> list:
+        rows_out = []
+        if not ws:
+            return rows_out
+        headers = [str(c.value or "").strip().lower()
+                   for c in next(ws.iter_rows(min_row=1, max_row=1))]
+        for row in ws.iter_rows(min_row=2, values_only=True):
+            if not any(row):
+                continue
+            row_data = {headers[i]: row[i]
+                        for i in range(len(headers)) if i < len(row)}
+            rows_out.append(row_data)
+        return rows_out
+
+    # ── Invoices sheet — accept Sheet1/Invoices/Invoice/Data ─────────────────
+    inv_ws = _find_sheet(["Invoices", "Invoice", "Sheet1", "Data", "Sale Sheet",
+                          "Sales", "FBR", "Sheet"])
+    results["invoices"] = _read_sheet(inv_ws)
 
     # ── Customers sheet ───────────────────────────────────────────────────────
-    if "Customers" in wb.sheetnames:
-        ws = wb["Customers"]
-        headers = [str(c.value or "").strip().lower() for c in next(ws.iter_rows(min_row=1, max_row=1))]
-        for row in ws.iter_rows(min_row=2, values_only=True):
-            if not any(row):
-                continue
-            row_data = {headers[i]: row[i] for i in range(len(headers)) if i < len(row)}
-            results["customers"].append(row_data)
+    cust_ws = _find_sheet(["Customers", "Customer", "Buyers"])
+    results["customers"] = _read_sheet_plain(cust_ws)
 
     # ── Products sheet ────────────────────────────────────────────────────────
-    if "Products" in wb.sheetnames:
-        ws = wb["Products"]
-        headers = [str(c.value or "").strip().lower() for c in next(ws.iter_rows(min_row=1, max_row=1))]
-        for row in ws.iter_rows(min_row=2, values_only=True):
-            if not any(row):
-                continue
-            row_data = {headers[i]: row[i] for i in range(len(headers)) if i < len(row)}
-            results["products"].append(row_data)
+    prod_ws = _find_sheet(["Products", "Product", "Items", "Inventory"])
+    results["products"] = _read_sheet_plain(prod_ws)
 
     return results
 
