@@ -144,12 +144,15 @@ def get_status(invoice_id: str):
 
 
 # ── Invoice history ───────────────────────────────────────────────────────────
+TEST_TENANT_ID = "00000000-0000-0000-0000-000000000001"
+
 @router.get("/history")
-def get_history(tenant_id: str = "test-tenant", limit: int = 50, offset: int = 0):
+def get_history(limit: int = 50, offset: int = 0):
     result = supabase.table("invoices").select(
-        "id, invoice_type, invoice_date, buyer_seller_name, "
-        "total_retail_price, status, tracking_no, attempts, created_at"
-    ).eq("tenant_id", tenant_id).order(
+        "id, invoice_number, invoice_type, invoice_date, buyer_business_name, "
+        "total_retail_price, total_sales_tax, publish_status, status, "
+        "tracking_no, attempts, error_msg, created_at"
+    ).eq("tenant_id", TEST_TENANT_ID).order(
         "created_at", desc=True
     ).range(offset, offset + limit - 1).execute()
 
