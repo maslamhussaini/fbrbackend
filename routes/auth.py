@@ -45,10 +45,9 @@ def login(payload: AuthPayload):
             "user_id": str(user.id)
         }
     except Exception as e:
-        print(f"LOGIN ERROR: {e}")  # add this
         msg = str(e)
         if "Invalid login" in msg or "invalid_grant" in msg.lower():
-            return {"success": False, "error": "Invalid email or password {e}"}
+            return {"success": False, "error": "Invalid email or password"}
         return {"success": False, "error": msg}
 
 

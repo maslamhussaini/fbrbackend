@@ -155,3 +155,29 @@ def delete_product(product_id: str):
         "id", product_id
     ).execute()
     return {"success": True}
+
+
+# ── HS Code lookup ────────────────────────────────────────────────────────────
+@router.get("/hs-codes/{code}")
+def lookup_hs_code(code: str):
+    result = supabase.table("hs_codes").select("*").eq("code", code).execute()
+    if result.data:
+        return result.data[0]
+    # Try partial match
+    result = supabase.table("hs_codes").select("*").ilike(
+        "code", f"%{code}%"
+    ).limit(5).execute()
+    return {"matches": result.data} if result.data else {"description": None}
+
+
+@router.get("/hs-codes")
+def get_hs_codes(q: str = ""):
+    if q:
+        result = supabase.table("hs_codes").select("code,description,tax_rate").or_(
+            f"code.ilike.%{q}%,description.ilike.%{q}%"
+        ).limit(20).execute()
+    else:
+        result = supabase.table("hs_codes").select(
+            "code,description,tax_rate"
+        ).limit(50).execute()
+    return {"hs_codes": result.data}
