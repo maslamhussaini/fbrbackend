@@ -196,11 +196,31 @@ def build_payload_from_row(row_data: dict, tenant: dict, tenant_id: str) -> tupl
 # ── Parse Excel bulk file ─────────────────────────────────────────────────────
 
 def parse_bulk_excel(file_bytes: bytes) -> dict:
-    import openpyxl
-    from io import BytesIO
-
-    wb = openpyxl.load_workbook(BytesIO(file_bytes), data_only=True)
     results = {"invoices": [], "customers": [], "products": [], "errors": []}
+
+    # Try xlsx first, then xls
+    wb = None
+    try:
+        wb = openpyxl.load_workbook(BytesIO(file_bytes), data_only=True)
+    except Exception:
+        try:
+            import xlrd
+            xls = xlrd.open_workbook(file_contents=file_bytes)
+            wb  = openpyxl.Workbook()
+            wb.remove(wb.active)
+            for sheet_name in xls.sheet_names():
+                xls_ws = xls.sheet_by_name(sheet_name)
+                ws = wb.create_sheet(title=sheet_name)
+                for row in range(xls_ws.nrows):
+                    for col in range(xls_ws.ncols):
+                        ws.cell(row=row+1, column=col+1, value=xls_ws.cell(row, col).value)
+        except Exception as e:
+            results["errors"].append(f"Cannot open file: {str(e)}")
+            return results
+
+    if not wb:
+        results["errors"].append("Could not open file")
+        return results
 
     # ── Invoices sheet ────────────────────────────────────────────────────────
     if "Invoices" in wb.sheetnames:

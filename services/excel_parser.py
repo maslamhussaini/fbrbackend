@@ -2,6 +2,32 @@ import openpyxl
 from io import BytesIO
 from openpyxl.utils import get_column_letter
 
+
+def _open_workbook(file_bytes: bytes):
+    """Open Excel file — handles both .xlsx and .xls formats."""
+    # Try xlsx first
+    try:
+        return openpyxl.load_workbook(BytesIO(file_bytes), data_only=True), None
+    except Exception:
+        pass
+    # Try xls via xlrd
+    try:
+        import xlrd
+        from openpyxl import Workbook
+        xls = xlrd.open_workbook(file_contents=file_bytes)
+        wb  = Workbook()
+        wb.remove(wb.active)
+        for sheet_name in xls.sheet_names():
+            xls_ws = xls.sheet_by_name(sheet_name)
+            ws = wb.create_sheet(title=sheet_name)
+            for row in range(xls_ws.nrows):
+                for col in range(xls_ws.ncols):
+                    cell = xls_ws.cell(row, col)
+                    ws.cell(row=row+1, column=col+1, value=cell.value)
+        return wb, None
+    except Exception as e:
+        return None, f"Cannot open file: {str(e)}"
+
 # ── Invoice header columns ────────────────────────────────────────────────────
 HEADER_COLUMNS = {
     "invoice date":              "invoice_date",
@@ -55,11 +81,9 @@ def parse_excel(file_bytes: bytes) -> dict:
     header = {}
     items = []
 
-    try:
-        wb = openpyxl.load_workbook(BytesIO(file_bytes), data_only=True)
-    except Exception as e:
-        return {"success": False, "header": {}, "items": [],
-                "errors": [f"Cannot open file: {str(e)}"]}
+    wb, err = _open_workbook(file_bytes)
+    if err:
+        return {"success": False, "header": {}, "items": [], "errors": [err]}
 
     # ── Header sheet ──────────────────────────────────────────────────────────
     if "Invoice" not in wb.sheetnames:
