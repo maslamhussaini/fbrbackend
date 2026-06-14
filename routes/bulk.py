@@ -181,3 +181,141 @@ def get_hs_codes(q: str = ""):
             "code,description,tax_rate"
         ).limit(50).execute()
     return {"hs_codes": result.data}
+
+
+# ── Invoice queue management ──────────────────────────────────────────────────
+
+@router.get("/invoices")
+def get_queued_invoices(batch_id: str = "", status: str = ""):
+    """Get all invoices in queue with details for management UI."""
+    q = supabase.table("invoice_queue").select(
+        "id, batch_id, row_number, status, raw_data, invoice_payload, "
+        "tracking_no, error_msg, validation_errors, attempts, "
+        "created_at, submitted_at, source_type"
+    ).eq("tenant_id", TEST_TENANT_ID)
+
+    if batch_id:
+        q = q.eq("batch_id", batch_id)
+    if status:
+        q = q.eq("status", status)
+
+    result = q.order("created_at", desc=True).limit(500).execute()
+
+    # Enrich with readable fields from payload
+    invoices = []
+    for row in (result.data or []):
+        payload = row.get("invoice_payload") or {}
+        raw     = row.get("raw_data") or {}
+        invoices.append({
+            "id":            row["id"],
+            "batch_id":      row.get("batch_id",""),
+            "row_number":    row.get("row_number",0),
+            "status":        row.get("status",""),
+            "invoice_date":  payload.get("invoiceDate") or str(raw.get("invoice_date","")),
+            "buyer_name":    payload.get("buyerBusinessName") or raw.get("buyer_name",""),
+            "buyer_ntn":     payload.get("buyerNTNCNIC") or raw.get("buyer_ntn",""),
+            "scenario_id":   payload.get("scenarioId",""),
+            "ref_no":        payload.get("invoiceRefNo") or str(raw.get("invoice_ref_no","")),
+            "items_count":   len(payload.get("items",[])),
+            "tracking_no":   row.get("tracking_no",""),
+            "error_msg":     row.get("error_msg",""),
+            "warnings":      row.get("validation_errors") or [],
+            "attempts":      row.get("attempts",0),
+            "created_at":    row.get("created_at",""),
+            "submitted_at":  row.get("submitted_at",""),
+            # full data for edit dialog
+            "payload":       payload,
+            "raw_data":      raw,
+        })
+
+    # Stats
+    all_rows = supabase.table("invoice_queue").select("status").eq(
+        "tenant_id", TEST_TENANT_ID
+    ).execute()
+    counts = {}
+    for r in (all_rows.data or []):
+        s = r["status"]
+        counts[s] = counts.get(s, 0) + 1
+
+    return {"invoices": invoices, "total": len(invoices), "counts": counts}
+
+
+@router.put("/invoices/{invoice_id}")
+def update_queued_invoice(invoice_id: str, data: dict):
+    """Edit a queued invoice before submission."""
+    try:
+        # Rebuild payload from updated raw_data if provided
+        update = {}
+        if "raw_data" in data:
+            update["raw_data"] = data["raw_data"]
+        if "invoice_payload" in data:
+            update["invoice_payload"] = data["invoice_payload"]
+        if "status" in data:
+            update["status"] = data["status"]
+
+        supabase.table("invoice_queue").update(update).eq(
+            "id", invoice_id
+        ).execute()
+        return {"success": True}
+    except Exception as e:
+        return {"success": False, "error": str(e)}
+
+
+@router.delete("/invoices/{invoice_id}")
+def delete_queued_invoice(invoice_id: str):
+    """Delete a queued invoice."""
+    try:
+        supabase.table("invoice_queue").delete().eq("id", invoice_id).execute()
+        return {"success": True}
+    except Exception as e:
+        return {"success": False, "error": str(e)}
+
+
+@router.post("/invoices/submit-selected")
+async def submit_selected_invoices(data: dict):
+    """Submit specific invoices by ID list."""
+    ids     = data.get("ids", [])
+    results = {"submitted": 0, "failed": 0, "errors": []}
+
+    tenant = supabase.table("tenants").select("*").eq(
+        "id", TEST_TENANT_ID
+    ).single().execute()
+
+    from services.fbr import post_invoice_to_fbr
+    from datetime import datetime
+
+    for inv_id in ids:
+        row = supabase.table("invoice_queue").select("*").eq(
+            "id", inv_id
+        ).single().execute()
+
+        if not row.data:
+            continue
+
+        payload  = row.data.get("invoice_payload")
+        attempts = row.data.get("attempts", 0) + 1
+
+        supabase.table("invoice_queue").update({
+            "status": "submitting", "attempts": attempts
+        }).eq("id", inv_id).execute()
+
+        result = await post_invoice_to_fbr(payload)
+
+        if result["success"]:
+            supabase.table("invoice_queue").update({
+                "status":       "submitted",
+                "tracking_no":  result.get("invoice_no"),
+                "fbr_response": result["raw"],
+                "error_msg":    None,
+                "submitted_at": datetime.utcnow().isoformat(),
+            }).eq("id", inv_id).execute()
+            results["submitted"] += 1
+        else:
+            supabase.table("invoice_queue").update({
+                "status":    "failed",
+                "error_msg": result.get("error",""),
+            }).eq("id", inv_id).execute()
+            results["failed"] += 1
+            results["errors"].append(result.get("error",""))
+
+    return results

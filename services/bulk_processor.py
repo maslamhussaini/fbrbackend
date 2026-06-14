@@ -163,10 +163,11 @@ def build_payload_from_row(row_data: dict, tenant: dict, tenant_id: str) -> tupl
         total        = round(value_excl + sales_tax, 2)
         ft           = round(value_excl * further_tax, 2) if further_tax else 0
 
+        # Warnings - log but don't block
         if not hs:
-            errors.append(f"Item missing HS Code")
-        elif len(hs.replace(".", "")) != 8:
-            errors.append(f"HS Code '{hs}' must be 8 digits")
+            errors.append("WARNING: Item missing HS Code — will still upload")
+        elif len(hs.replace(".", "")) < 6:
+            errors.append(f"WARNING: HS Code {hs!r} looks short — verify")
 
         built_items.append({
             "hsCode":                          hs,
@@ -403,12 +404,17 @@ def create_batch(filename: str, source_type: str, tenant_id: str,
 
         payload, errors = build_payload_from_row(row_data, tenant, tenant_id)
 
-        if errors:
+        # Warnings don't block — only hard errors do
+        hard_errors = [e for e in errors if not e.startswith("WARNING")]
+        warnings    = [e for e in errors if e.startswith("WARNING")]
+
+        if hard_errors:
             status = "invalid"
             invalid_rows += 1
         else:
             status = "valid"
             valid_rows += 1
+            errors = warnings  # keep warnings for info display
 
         queue_rows.append({
             "id":                str(uuid.uuid4()),
