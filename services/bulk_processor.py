@@ -10,6 +10,18 @@ from services.fbr import post_invoice_to_fbr
 
 logger = logging.getLogger(__name__)
 
+def _json_safe(obj):
+    """Convert values to JSON-safe types."""
+    if isinstance(obj, dict):
+        return {k: _json_safe(v) for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [_json_safe(v) for v in obj]
+    if hasattr(obj, "strftime"):
+        return obj.strftime("%Y-%m-%d")
+    if isinstance(obj, (int, float, str, bool, type(None))):
+        return obj
+    return str(obj)
+
 TEST_TENANT_ID = "00000000-0000-0000-0000-000000000001"
 
 # ── Scenario auto-detection ───────────────────────────────────────────────────
