@@ -1,628 +1,468 @@
-import openpyxl
-from io import BytesIO
-import uuid
-import json
-import logging
-from datetime import datetime
-from typing import Optional
-from db.supabase import supabase
-from services.fbr import post_invoice_to_fbr
-
-logger = logging.getLogger(__name__)
-
-def _json_safe(obj):
-    """Convert values to JSON-safe types."""
-    if isinstance(obj, dict):
-        return {k: _json_safe(v) for k, v in obj.items()}
-    if isinstance(obj, list):
-        return [_json_safe(v) for v in obj]
-    if hasattr(obj, "strftime"):
-        return obj.strftime("%Y-%m-%d")
-    if isinstance(obj, (int, float, str, bool, type(None))):
-        return obj
-    return str(obj)
-
-TEST_TENANT_ID = "00000000-0000-0000-0000-000000000001"
-
-# ── Scenario auto-detection ───────────────────────────────────────────────────
-
-def detect_scenario(registration_status: str, sale_type: str = "") -> str:
-    """Auto-detect FBR scenario from customer registration status."""
-    s = str(registration_status).lower()
-    if "unregist" in s:
-        return "SN002"
-    t = str(sale_type).lower()
-    if "exempt" in t:
-        return "SN006"
-    if "zero" in t:
-        return "SN007"
-    if "3rd schedule" in t or "third schedule" in t:
-        return "SN008"
-    if "reduced" in t:
-        return "SN005"
-    return "SN001"  # default: registered, standard rate
+import httpx
+from config import API_BASE_URL
 
 
-# ── Customer lookup ───────────────────────────────────────────────────────────
+class ApiClient:
+    def __init__(self):
+        self.base    = API_BASE_URL
+        self.timeout = 60.0
+        self.token   = None
 
-def get_customer(tenant_id: str, ntn_or_name: str) -> Optional[dict]:
-    """Look up customer by NTN/CNIC or name."""
-    if not ntn_or_name or str(ntn_or_name).lower() in ("unregistered", "0000000", "", "none"):
-        return None
-    try:
-        result = supabase.table("customers").select("*").eq(
-            "tenant_id", tenant_id
-        ).eq("ntn_cnic", str(ntn_or_name)).execute()
-        if result.data:
-            return result.data[0]
+    def _headers(self):
+        h = {}
+        if self.token:
+            h["Authorization"] = f"Bearer {self.token}"
+        return h
 
-        result = supabase.table("customers").select("*").eq(
-            "tenant_id", tenant_id
-        ).ilike("name", f"%{ntn_or_name}%").execute()
-        if result.data:
-            return result.data[0]
-    except Exception as e:
-        logger.warning(f"Customer lookup failed for '{ntn_or_name}': {e}")
-
-    return None
-
-
-def get_product(tenant_id: str, hs_code_or_code: str) -> Optional[dict]:
-    """Look up product by HS code or product code."""
-    if not hs_code_or_code:
-        return None
-    try:
-        result = supabase.table("products").select("*").eq(
-            "tenant_id", tenant_id
-        ).eq("hs_code", str(hs_code_or_code)).execute()
-        if result.data:
-            return result.data[0]
-
-        result = supabase.table("products").select("*").eq(
-            "tenant_id", tenant_id
-        ).eq("product_code", str(hs_code_or_code)).execute()
-        return result.data[0] if result.data else None
-    except Exception as e:
-        logger.warning(f"Product lookup failed for '{hs_code_or_code}': {e}")
-        return None
-
-
-def get_tenant(tenant_id: str) -> Optional[dict]:
-    try:
-        result = supabase.table("tenants").select("*").eq("id", tenant_id).execute()
-        return result.data[0] if result.data else None
-    except Exception as e:
-        logger.warning(f"Tenant lookup failed: {e}")
-        return None
-
-# ── Build FBR payload from queue row ─────────────────────────────────────────
-
-def build_payload_from_row(row_data: dict, tenant: dict, tenant_id: str) -> tuple[dict, list]:
-    """
-    Enrich raw row data with customer/product master data.
-    Returns (payload, errors).
-    """
-    errors = []
-
-    # ── Normalize column names — map ANY format to internal keys ────────────
-    ALIASES = {
-        # Template format
-        "invoice date":           "invoice_date",
-        "invoice ref no":         "invoice_ref_no",
-        "buyer ntn/cnic":         "buyer_ntn",
-        "buyer name":             "buyer_name",
-        "buyer province":         "buyer_province",
-        "buyer address":          "buyer_address",
-        "buyer registration":     "buyer_registration_type",
-        "buyer registration type":"buyer_registration_type",
-        "hs code":                "hs_code",
-        "product description":    "product_description",
-        "uom":                    "uom",
-        "quantity":               "quantity",
-        "value excl st":          "value_excl_st",
-        "sales tax":              "sales_tax",
-        "rate":                   "gst_rate",
-        "sale type":              "sale_type",
-        "sro schedule no":        "sro_schedule_no",
-        "sro item serial no":     "sro_item_serial",
-        "further tax":            "further_tax_amt",
-        "retail price":           "retail_price",
-        # Business Box export format
-        "buyer ntn":              "buyer_ntn",
-        "buyer cnic":             "buyer_ntn",
-        "buyer type":             "buyer_registration_type",
-        "document type":          "doc_type",
-        "document number":        "invoice_ref_no",
-        "document date":          "invoice_date",
-        "description":            "description_raw",
-        "value of sales excluding sales tax": "value_excl_st",
-        "fixed / notified value or retail price": "retail_price",
-        "sales tax/ fed in st mode": "sales_tax",
-        "rate.1":                 "unit_rate",
-        "sro no. / schedule no.": "sro_schedule_no",
-        "item sr. no.":           "sro_item_serial",
-        "total value of sales":   "total_value",
-        "sr.":                    "_row_number",
-    }
-    row_data = {ALIASES.get(k, k): v for k, v in row_data.items()}
-
-    # ── Split Description "6309 - Textiles worn clothing..." → HS + desc ──
-    desc_raw = str(row_data.get("description_raw") or "")
-    if desc_raw and " - " in desc_raw and not row_data.get("hs_code"):
-        parts = desc_raw.split(" - ", 1)
-        row_data["hs_code"]             = parts[0].strip()
-        row_data["product_description"] = parts[1].strip() if len(parts) > 1 else desc_raw
-    elif desc_raw and not row_data.get("product_description"):
-        row_data["product_description"] = desc_raw
-
-    # ── Handle datetime objects for dates ──────────────────────────────────
-    inv_date = row_data.get("invoice_date")
-    if inv_date and hasattr(inv_date, "strftime"):
-        row_data["invoice_date"] = inv_date.strftime("%Y-%m-%d")
-    elif inv_date:
-        row_data["invoice_date"] = str(inv_date)
-
-    # ── Use gst_rate if rate wasn't mapped to sales_tax ───────────────────
-    if not row_data.get("gst_rate"):
-        row_data["gst_rate"] = 18  # default GST
-
-    # Resolve customer
-    buyer_id = row_data.get("buyer_ntn") or row_data.get("buyer_name") or ""
-    customer = get_customer(tenant_id, buyer_id)
-
-    if customer:
-        reg_status = customer["registration_status"]
-        buyer_ntn  = customer["ntn_cnic"] or buyer_id
-        buyer_name = customer["name"]
-        buyer_prov = customer.get("province", "SINDH")
-        buyer_addr = customer.get("address") or customer.get("city", "PAKISTAN")
-        further_tax = float(customer.get("further_tax_percent") or 0) / 100
-    else:
-        reg_status = row_data.get("buyer_registration_type", "Unregistered")
-        buyer_ntn  = buyer_id
-        buyer_name = row_data.get("buyer_name", "UNREGISTERED")
-        buyer_prov = row_data.get("buyer_province", "SINDH")
-        buyer_addr = row_data.get("buyer_address", "PAKISTAN")
-        further_tax = 0.04 if "unregist" in reg_status.lower() else 0
-
-    # Build items
-    items_raw = row_data.get("items", [])
-    if not items_raw and row_data.get("hs_code"):
-        # Single-item row (flat Excel format)
-        items_raw = [row_data]
-
-    built_items = []
-    for item in items_raw:
-        hs = str(item.get("hs_code") or item.get("hsCode", ""))
-        product = get_product(tenant_id, hs) if hs else None
-
-        if product:
-            rate       = product["rate"]
-            uom        = product["uom"]
-            sale_type  = product["sale_type"]
-            sro_no     = product.get("sro_schedule_no", "")
-            sro_serial = product.get("sro_item_serial", "")
-            fed        = float(product.get("fed_percent") or 0)
-            mrp        = float(product.get("mrp") or 0)
-            tax_pct    = float(product.get("sales_tax_pct") or 18)
-        else:
-            rate       = str(item.get("gst_rate") or item.get("rate", "18"))
-            uom        = str(item.get("uom") or item.get("uoM", "KG"))
-            sale_type  = item.get("sale_type") or item.get("saleType",
-                         "Goods at standard rate (default)")
-            sro_no     = str(item.get("sro_schedule_no") or "")
-            sro_serial = str(item.get("sro_item_serial") or "")
-            fed        = float(item.get("fed_payable") or 0)
-            mrp        = float(item.get("retail_price") or
-                               item.get("fixedNotifiedValueOrRetailPrice") or 0)
-            try:
-                tax_pct = float(str(rate).replace("%",""))
-            except (ValueError, TypeError):
-                tax_pct = 18
-
-        qty          = float(item.get("quantity") or 0)
-        value_excl   = float(item.get("value_excl_st") or
-                             item.get("valueSalesExcludingST") or 0)
-        # Use pre-calculated sales tax if available, otherwise compute
-        sales_tax    = float(item.get("sales_tax") or 0)
-        if not sales_tax and value_excl:
-            sales_tax = round(value_excl * tax_pct / 100, 2)
-        total        = round(value_excl + sales_tax, 2)
-        ft           = round(value_excl * further_tax, 2) if further_tax else 0
-
-        # Warnings - log but don't block
-        if not hs:
-            errors.append("WARNING: Item missing HS Code — will still upload")
-        elif len(hs.replace(".", "")) < 6:
-            errors.append(f"WARNING: HS Code {hs!r} looks short — verify")
-
-        built_items.append({
-            "hsCode":                          hs,
-            "productDescription":              str(item.get("product_description") or
-                                                   item.get("productDescription") or
-                                                   (product["description"] if product else "")),
-            "rate":                            rate,
-            "uoM":                             uom,
-            "quantity":                        qty,
-            "totalValues":                     total,
-            "valueSalesExcludingST":           value_excl,
-            "fixedNotifiedValueOrRetailPrice": mrp,
-            "salesTaxApplicable":              sales_tax,
-            "salesTaxWithheldAtSource":        0,
-            "extraTax":                        0,
-            "furtherTax":                      ft,
-            "sroScheduleNo":                   sro_no,
-            "fedPayable":                      fed,
-            "discount":                        float(item.get("discount") or 0),
-            "saleType":                        sale_type,
-            "sroItemSerialNo":                 sro_serial,
-        })
-
-    if not built_items:
-        errors.append("No items found in row")
-
-    # Detect scenario
-    first_sale_type = built_items[0]["saleType"] if built_items else ""
-    scenario = row_data.get("scenario_id") or detect_scenario(reg_status, first_sale_type)
-
-    payload = {
-        "invoiceType":            "Sale Invoice",
-        "invoiceDate":            str(row_data.get("invoice_date") or
-                                      datetime.today().strftime("%Y-%m-%d")),
-        "sellerNTNCNIC":          tenant["ntn_cnic"],
-        "sellerBusinessName":     tenant["name"],
-        "sellerProvince":         tenant.get("province", "SINDH"),
-        "sellerAddress":          tenant.get("address", "PAKISTAN"),
-        "buyerNTNCNIC":           buyer_ntn,
-        "buyerBusinessName":      buyer_name,
-        "buyerProvince":          buyer_prov,
-        "buyerAddress":           buyer_addr,
-        "buyerRegistrationType":  reg_status,
-        "invoiceRefNo":           str(row_data.get("invoice_ref_no") or ""),
-        "scenarioId":             scenario,
-        "items":                  built_items,
-    }
-
-    return payload, errors
-
-
-# ── Parse Excel bulk file ─────────────────────────────────────────────────────
-
-def parse_bulk_excel(file_bytes: bytes) -> dict:
-    results = {"invoices": [], "customers": [], "products": [], "errors": []}
-
-    # Try xlsx first, then xls
-    wb = None
-    try:
-        wb = openpyxl.load_workbook(BytesIO(file_bytes), data_only=True)
-    except Exception:
+    def login(self, email, password):
         try:
-            import xlrd
-            xls = xlrd.open_workbook(file_contents=file_bytes)
-            wb  = openpyxl.Workbook()
-            wb.remove(wb.active)
-            for sheet_name in xls.sheet_names():
-                xls_ws = xls.sheet_by_name(sheet_name)
-                ws = wb.create_sheet(title=sheet_name)
-                for row in range(xls_ws.nrows):
-                    for col in range(xls_ws.ncols):
-                        ws.cell(row=row+1, column=col+1, value=xls_ws.cell(row, col).value)
+            with httpx.Client(timeout=self.timeout) as c:
+                r = c.post(f"{self.base}/auth/login", json={"email": email, "password": password})
+            data = r.json()
+            if data.get("success") and data.get("token"):
+                self.token = data["token"]
+            return data
         except Exception as e:
-            results["errors"].append(f"Cannot open file: {str(e)}")
-            return results
+            return {"success": False, "error": str(e)}
 
-    if not wb:
-        results["errors"].append("Could not open file")
-        return results
+    def signup(self, email, password):
+        try:
+            with httpx.Client(timeout=self.timeout) as c:
+                r = c.post(f"{self.base}/auth/signup", json={"email": email, "password": password})
+            return r.json()
+        except Exception as e:
+            return {"success": False, "error": str(e)}
 
-    def _find_sheet(names: list) -> object:
-        """Find sheet by any of the given names (case-insensitive)."""
-        for name in names:
-            for sname in wb.sheetnames:
-                if sname.lower() == name.lower():
-                    return wb[sname]
-        return None
+    def verify_otp(self, email, otp):
+        try:
+            with httpx.Client(timeout=self.timeout) as c:
+                r = c.post(f"{self.base}/auth/verify-otp", json={"email": email, "token": otp})
+            data = r.json()
+            if data.get("success") and data.get("token"):
+                self.token = data["token"]
+            return data
+        except Exception as e:
+            return {"success": False, "error": str(e)}
 
-    def _read_sheet(ws) -> list:
-        rows_out = []
-        if not ws:
-            return rows_out
-        # Handle duplicate headers by appending .1, .2 etc
-        raw_headers = [str(c.value or "").strip().lower()
-                       for c in next(ws.iter_rows(min_row=1, max_row=1))]
-        headers = []
-        seen = {}
-        for h in raw_headers:
-            if h in seen:
-                seen[h] += 1
-                headers.append(f"{h}.{seen[h]}")
+    def get_user_role(self):
+        try:
+            with httpx.Client(timeout=self.timeout) as c:
+                r = c.get(f"{self.base}/auth/me", headers=self._headers())
+            return r.json().get("role", "user")
+        except Exception:
+            return "user"
+
+    def download_template(self, save_path):
+        try:
+            with httpx.Client(timeout=self.timeout) as c:
+                r = c.get(f"{self.base}/invoices/template", headers=self._headers())
+            if r.status_code == 200:
+                with open(save_path, "wb") as f:
+                    f.write(r.content)
+                return {"success": True}
+            return {"success": False, "error": f"Server error {r.status_code}"}
+        except Exception as e:
+            return {"success": False, "error": str(e)}
+
+    def validate_excel(self, file_path):
+        try:
+            with open(file_path, "rb") as f:
+                files = {"file": (file_path, f, "application/octet-stream")}
+                with httpx.Client(timeout=self.timeout) as c:
+                    r = c.post(f"{self.base}/invoices/validate", files=files, headers=self._headers())
+            return r.json()
+        except Exception as e:
+            return {"valid": False, "errors": [str(e)], "data": None}
+
+    def submit_excel(self, file_path):
+        try:
+            with open(file_path, "rb") as f:
+                files = {"file": (file_path, f, "application/octet-stream")}
+                with httpx.Client(timeout=self.timeout) as c:
+                    r = c.post(f"{self.base}/invoices/submit", files=files, headers=self._headers())
+            return r.json()
+        except Exception as e:
+            return {"success": False, "error": str(e)}
+
+    def get_history(self, limit=50):
+        try:
+            with httpx.Client(timeout=self.timeout) as c:
+                r = c.get(f"{self.base}/invoices/history", params={"limit": limit}, headers=self._headers())
+            return r.json()
+        except Exception as e:
+            return {"invoices": [], "error": str(e)}
+
+    def retry_invoice(self, invoice_id):
+        try:
+            with httpx.Client(timeout=self.timeout) as c:
+                r = c.post(f"{self.base}/invoices/retry/{invoice_id}", headers=self._headers())
+            return r.json()
+        except Exception as e:
+            return {"success": False, "error": str(e)}
+
+    def get_settings(self):
+        try:
+            with httpx.Client(timeout=self.timeout) as c:
+                r = c.get(f"{self.base}/settings", headers=self._headers())
+            return r.json()
+        except Exception as e:
+            return {"success": False, "error": str(e), "data": None}
+
+    def save_settings(self, data):
+        try:
+            with httpx.Client(timeout=self.timeout) as c:
+                r = c.post(f"{self.base}/settings", json=data, headers=self._headers())
+            return r.json()
+        except Exception as e:
+            return {"success": False, "error": str(e)}
+
+    def test_fbr_token(self, token):
+        try:
+            with httpx.Client(timeout=self.timeout) as c:
+                r = c.post(f"{self.base}/settings/test-token", json={"token": token}, headers=self._headers())
+            return r.json()
+        except Exception as e:
+            return {"valid": False, "error": str(e)}
+
+    def ping(self):
+        try:
+            with httpx.Client(timeout=5.0) as c:
+                r = c.get(f"{self.base}/")
+            return r.status_code == 200
+        except Exception:
+            return False
+
+    def bulk_download_template(self, save_path):
+        try:
+            with httpx.Client(timeout=self.timeout) as c:
+                r = c.get(f"{self.base}/bulk/template", headers=self._headers())
+            if r.status_code == 200:
+                with open(save_path, "wb") as f:
+                    f.write(r.content)
+                return {"success": True}
+            return {"success": False, "error": f"Server error {r.status_code}"}
+        except Exception as e:
+            return {"success": False, "error": str(e)}
+
+    def bulk_upload(self, file_path):
+        try:
+            import os
+            filename = os.path.basename(file_path)
+            with open(file_path, "rb") as f:
+                mime = "application/json" if filename.endswith(".json") else "application/octet-stream"
+                files = {"file": (filename, f, mime)}
+                with httpx.Client(timeout=120.0) as c:
+                    r = c.post(f"{self.base}/bulk/upload", files=files, headers=self._headers())
+            if r.status_code == 200:
+                return r.json()
             else:
-                seen[h] = 0
-                headers.append(h)
+                try:
+                    return r.json()
+                except Exception:
+                    return {"error": f"Server error {r.status_code}: {r.text[:200]}"}
+        except Exception as e:
+            return {"error": str(e)}
 
-        for row_idx, row in enumerate(ws.iter_rows(min_row=2, values_only=True), 2):
-            if not any(row):
-                continue
-            row_data = {headers[i]: row[i]
-                        for i in range(len(headers)) if i < len(row)}
-            rows_out.append({"row": row_idx, "data": row_data})
-        return rows_out
+    def bulk_confirm(self, batch_id):
+        try:
+            with httpx.Client(timeout=300.0) as c:
+                r = c.post(f"{self.base}/bulk/confirm/{batch_id}", headers=self._headers())
+            return r.json()
+        except Exception as e:
+            return {"error": str(e)}
 
-    def _read_sheet_plain(ws) -> list:
-        rows_out = []
-        if not ws:
-            return rows_out
-        raw_headers = [str(c.value or "").strip().lower()
-                       for c in next(ws.iter_rows(min_row=1, max_row=1))]
-        headers = []
-        seen = {}
-        for h in raw_headers:
-            if h in seen:
-                seen[h] += 1
-                headers.append(f"{h}.{seen[h]}")
-            else:
-                seen[h] = 0
-                headers.append(h)
+    def bulk_status(self, batch_id):
+        try:
+            with httpx.Client(timeout=10.0) as c:
+                r = c.get(f"{self.base}/bulk/status/{batch_id}", headers=self._headers())
+            return r.json()
+        except Exception as e:
+            return {"error": str(e)}
 
-        for row in ws.iter_rows(min_row=2, values_only=True):
-            if not any(row):
-                continue
-            row_data = {headers[i]: row[i]
-                        for i in range(len(headers)) if i < len(row)}
-            rows_out.append(row_data)
-        return rows_out
+    def get_customers(self):
+        try:
+            with httpx.Client(timeout=self.timeout) as c:
+                r = c.get(f"{self.base}/bulk/customers", headers=self._headers())
+            return r.json()
+        except Exception as e:
+            return {"customers": [], "error": str(e)}
 
-    # ── Invoices sheet — accept Sheet1/Invoices/Invoice/Data ─────────────────
-    inv_ws = _find_sheet(["Invoices", "Invoice", "Sheet1", "Data", "Sale Sheet",
-                          "Sales", "FBR", "Sheet"])
-    results["invoices"] = _read_sheet(inv_ws)
+    def save_customer(self, data):
+        try:
+            with httpx.Client(timeout=self.timeout) as c:
+                r = c.post(f"{self.base}/bulk/customers", json=data, headers=self._headers())
+            return r.json()
+        except Exception as e:
+            return {"success": False, "error": str(e)}
 
-    # ── Customers sheet ───────────────────────────────────────────────────────
-    cust_ws = _find_sheet(["Customers", "Customer", "Buyers"])
-    results["customers"] = _read_sheet_plain(cust_ws)
+    def get_products(self):
+        try:
+            with httpx.Client(timeout=self.timeout) as c:
+                r = c.get(f"{self.base}/bulk/products", headers=self._headers())
+            return r.json()
+        except Exception as e:
+            return {"products": [], "error": str(e)}
 
-    # ── Products sheet ────────────────────────────────────────────────────────
-    prod_ws = _find_sheet(["Products", "Product", "Items", "Inventory"])
-    results["products"] = _read_sheet_plain(prod_ws)
+    def save_product(self, data):
+        try:
+            with httpx.Client(timeout=self.timeout) as c:
+                r = c.post(f"{self.base}/bulk/products", json=data, headers=self._headers())
+            return r.json()
+        except Exception as e:
+            return {"success": False, "error": str(e)}
 
-    return results
+    def lookup_hs_code(self, code):
+        try:
+            with httpx.Client(timeout=self.timeout) as c:
+                r = c.get(f"{self.base}/bulk/hs-codes/{code}", headers=self._headers())
+            return r.json()
+        except Exception as e:
+            return {"description": None}
 
+    # ── Sales invoices ────────────────────────────────────────────────────────
+    def get_sales_invoices(self, status=""):
+        try:
+            params = {"status": status} if status else {}
+            with httpx.Client(timeout=self.timeout) as c:
+                r = c.get(f"{self.base}/sales-invoices", params=params, headers=self._headers())
+            return r.json()
+        except Exception as e:
+            return {"invoices": [], "stats": {}, "error": str(e)}
 
-# ── Parse JSON bulk file ──────────────────────────────────────────────────────
+    def get_sales_invoice(self, invoice_id):
+        try:
+            with httpx.Client(timeout=self.timeout) as c:
+                r = c.get(f"{self.base}/sales-invoices/{invoice_id}", headers=self._headers())
+            return r.json()
+        except Exception as e:
+            return None
 
-def parse_bulk_json(file_bytes: bytes) -> dict:
-    data = json.loads(file_bytes.decode("utf-8"))
-    results = {"invoices": [], "customers": [], "products": [], "errors": []}
+    def create_sales_invoice(self, data):
+        try:
+            with httpx.Client(timeout=self.timeout) as c:
+                r = c.post(f"{self.base}/sales-invoices", json=data, headers=self._headers())
+            return r.json()
+        except Exception as e:
+            return {"success": False, "error": str(e)}
 
-    if isinstance(data, list):
-        # Array of invoices
-        for i, item in enumerate(data):
-            results["invoices"].append({"row": i + 1, "data": item})
-    elif isinstance(data, dict):
-        if "invoices" in data:
-            for i, item in enumerate(data["invoices"]):
-                results["invoices"].append({"row": i + 1, "data": item})
-        if "customers" in data:
-            results["customers"] = data["customers"]
-        if "products" in data:
-            results["products"] = data["products"]
-        # Single invoice
-        if "invoiceDate" in data or "invoice_date" in data:
-            results["invoices"].append({"row": 1, "data": data})
+    def submit_sales_invoice(self, invoice_id):
+        try:
+            with httpx.Client(timeout=60.0) as c:
+                r = c.post(f"{self.base}/sales-invoices/{invoice_id}/submit",
+                           headers=self._headers())
+            return r.json()
+        except Exception as e:
+            return {"success": False, "error": str(e)}
 
-    return results
+    def cancel_sales_invoice(self, invoice_id):
+        try:
+            with httpx.Client(timeout=self.timeout) as c:
+                r = c.post(f"{self.base}/sales-invoices/{invoice_id}/cancel",
+                           headers=self._headers())
+            return r.json()
+        except Exception as e:
+            return {"success": False, "error": str(e)}
 
+    def download_invoice_pdf(self, invoice_id, save_path):
+        try:
+            with httpx.Client(timeout=30.0) as c:
+                r = c.get(f"{self.base}/sales-invoices/{invoice_id}/pdf",
+                          headers=self._headers())
+            if r.status_code == 200:
+                with open(save_path, "wb") as f:
+                    f.write(r.content)
+                return {"success": True}
+            return {"success": False, "error": f"Status {r.status_code}"}
+        except Exception as e:
+            return {"success": False, "error": str(e)}
 
-# ── Upsert customers/products from bulk file ──────────────────────────────────
+    def lookup(self, kind, q=""):
+        try:
+            with httpx.Client(timeout=self.timeout) as c:
+                r = c.get(f"{self.base}/sales-invoices/lookup/{kind}",
+                          params={"q": q}, headers=self._headers())
+            return r.json()
+        except Exception as e:
+            return {"products": [], "customers": []}
 
-def upsert_customers(customers: list, tenant_id: str) -> int:
-    count = 0
-    for c in customers:
-        if not c.get("name") and not c.get("ntn") and not c.get("ntn_cnic"):
-            continue
-        row = {
-            "tenant_id":           tenant_id,
-            "name":                str(c.get("name") or c.get("buyer name") or ""),
-            "ntn_cnic":            str(c.get("ntn") or c.get("ntn_cnic") or c.get("ntn/cnic") or ""),
-            "registration_status": str(c.get("registration_status") or
-                                       c.get("registration status") or "Unregistered"),
-            "province":            str(c.get("province") or "SINDH"),
-            "city":                str(c.get("city") or ""),
-            "address":             str(c.get("address") or ""),
-            "wht_percent":         float(c.get("wht_percent") or c.get("wht %") or 0),
-            "further_tax_percent": float(c.get("further_tax_percent") or
-                                         c.get("further tax %") or 0),
-        }
-        supabase.table("customers").upsert(row, on_conflict="tenant_id,ntn_cnic").execute()
-        count += 1
-    return count
+    def get_queue_status(self):
+        try:
+            with httpx.Client(timeout=10.0) as c:
+                r = c.get(f"{self.base}/queue/status", headers=self._headers())
+            return r.json()
+        except Exception as e:
+            return {"error": str(e), "total": 0}
 
+    def trigger_queue_now(self):
+        try:
+            with httpx.Client(timeout=30.0) as c:
+                r = c.post(f"{self.base}/queue/process-now", headers=self._headers())
+            return r.json()
+        except Exception as e:
+            return {"error": str(e)}
 
-def upsert_products(products: list, tenant_id: str) -> int:
-    count = 0
-    for p in products:
-        if not p.get("hs_code") and not p.get("hs code"):
-            continue
-        row = {
-            "tenant_id":       tenant_id,
-            "product_code":    str(p.get("product_code") or p.get("product code") or ""),
-            "description":     str(p.get("description") or p.get("product description") or ""),
-            "hs_code":         str(p.get("hs_code") or p.get("hs code") or ""),
-            "uom":             str(p.get("uom") or "KG"),
-            "rate":            str(p.get("rate") or "18%"),
-            "sales_tax_pct":   float(p.get("sales_tax_pct") or p.get("tax %") or 18),
-            "sale_type":       str(p.get("sale_type") or
-                                   "Goods at standard rate (default)"),
-            "sro_schedule_no": str(p.get("sro_schedule_no") or ""),
-            "sro_item_serial": str(p.get("sro_item_serial") or ""),
-            "fed_percent":     float(p.get("fed_percent") or 0),
-            "mrp":             float(p.get("mrp") or 0),
-        }
-        supabase.table("products").upsert(row, on_conflict="tenant_id,hs_code").execute()
-        count += 1
-    return count
+    def get_scheduler_settings(self):
+        try:
+            with httpx.Client(timeout=self.timeout) as c:
+                r = c.get(f"{self.base}/scheduler/status", headers=self._headers())
+            return r.json()
+        except Exception as e:
+            return {"running": False, "jobs": [], "config": {}}
 
+    def save_scheduler_settings(self, settings: dict):
+        try:
+            with httpx.Client(timeout=self.timeout) as c:
+                r = c.post(f"{self.base}/scheduler/settings/bulk",
+                           json=settings, headers=self._headers())
+            return r.json()
+        except Exception as e:
+            return {"success": False, "error": str(e)}
 
-# ── Create batch + queue rows ─────────────────────────────────────────────────
+    def toggle_auto_process(self):
+        try:
+            with httpx.Client(timeout=self.timeout) as c:
+                r = c.post(f"{self.base}/scheduler/toggle", headers=self._headers())
+            return r.json()
+        except Exception as e:
+            return {"success": False, "error": str(e)}
 
-def create_batch(filename: str, source_type: str, tenant_id: str,
-                 parsed: dict) -> dict:
-    """
-    Validate all rows, save to queue, return summary.
-    Does NOT submit to FBR yet — waits for user confirmation.
-    """
-    batch_id = str(uuid.uuid4())
-    tenant   = get_tenant(tenant_id)
+    # ── Setup screens ─────────────────────────────────────────────────────────
+    def get_hs_codes(self, q=""):
+        try:
+            with httpx.Client(timeout=self.timeout) as c:
+                r = c.get(f"{self.base}/setup/hs-codes",
+                          params={"q": q}, headers=self._headers())
+            return r.json()
+        except Exception as e:
+            return {"hs_codes": [], "error": str(e)}
 
-    if not tenant:
-        return {"error": "Tenant not found"}
+    def save_hs_code(self, data):
+        try:
+            with httpx.Client(timeout=self.timeout) as c:
+                r = c.post(f"{self.base}/setup/hs-codes",
+                           json=data, headers=self._headers())
+            return r.json()
+        except Exception as e:
+            return {"success": False, "error": str(e)}
 
-    # Upsert master data first
-    cust_count = upsert_customers(parsed.get("customers", []), tenant_id)
-    prod_count = upsert_products(parsed.get("products", []), tenant_id)
+    def import_hs_codes(self, codes: list):
+        try:
+            with httpx.Client(timeout=self.timeout) as c:
+                r = c.post(f"{self.base}/setup/hs-codes/bulk",
+                           json=codes, headers=self._headers())
+            return r.json()
+        except Exception as e:
+            return {"success": False, "error": str(e)}
 
-    valid_rows   = 0
-    invalid_rows = 0
-    queue_rows   = []
-    validation_summary = []
+    def get_units(self):
+        try:
+            with httpx.Client(timeout=self.timeout) as c:
+                r = c.get(f"{self.base}/setup/units", headers=self._headers())
+            return r.json()
+        except Exception as e:
+            return {"units": [], "error": str(e)}
 
-    for entry in parsed.get("invoices", []):
-        row_num  = entry["row"]
-        row_data = entry["data"]
+    def save_unit(self, data):
+        try:
+            with httpx.Client(timeout=self.timeout) as c:
+                r = c.post(f"{self.base}/setup/units",
+                           json=data, headers=self._headers())
+            return r.json()
+        except Exception as e:
+            return {"success": False, "error": str(e)}
 
-        payload, errors = build_payload_from_row(row_data, tenant, tenant_id)
+    def get_provinces(self):
+        try:
+            with httpx.Client(timeout=self.timeout) as c:
+                r = c.get(f"{self.base}/setup/provinces", headers=self._headers())
+            return r.json()
+        except Exception as e:
+            return {"provinces": [], "error": str(e)}
 
-        # Warnings don't block — only hard errors do
-        hard_errors = [e for e in errors if not e.startswith("WARNING")]
-        warnings    = [e for e in errors if e.startswith("WARNING")]
+    def save_province(self, data):
+        try:
+            with httpx.Client(timeout=self.timeout) as c:
+                r = c.post(f"{self.base}/setup/provinces",
+                           json=data, headers=self._headers())
+            return r.json()
+        except Exception as e:
+            return {"success": False, "error": str(e)}
 
-        if hard_errors:
-            status = "invalid"
-            invalid_rows += 1
-        else:
-            status = "valid"
-            valid_rows += 1
-            errors = warnings  # keep warnings for info display
+    def get_cities(self, province_code=""):
+        try:
+            params = {"province_code": province_code} if province_code else {}
+            with httpx.Client(timeout=self.timeout) as c:
+                r = c.get(f"{self.base}/setup/cities",
+                          params=params, headers=self._headers())
+            return r.json()
+        except Exception as e:
+            return {"cities": [], "error": str(e)}
 
-        queue_rows.append({
-            "id":                str(uuid.uuid4()),
-            "tenant_id":         tenant_id,
-            "batch_id":          batch_id,
-            "row_number":        row_num,
-            "source_type":       source_type,
-            "raw_data":          row_data,
-            "invoice_payload":   payload,
-            "status":            status,
-            "validation_errors": errors,
-            "attempts":          0,
-        })
+    def save_city(self, data):
+        try:
+            with httpx.Client(timeout=self.timeout) as c:
+                r = c.post(f"{self.base}/setup/cities",
+                           json=data, headers=self._headers())
+            return r.json()
+        except Exception as e:
+            return {"success": False, "error": str(e)}
 
-        validation_summary.append({
-            "row":    row_num,
-            "status": status,
-            "errors": errors,
-            "buyer":  payload.get("buyerBusinessName", ""),
-            "scenario": payload.get("scenarioId", ""),
-            "items":  len(payload.get("items", [])),
-        })
+    def get_areas(self, city_id=""):
+        try:
+            params = {"city_id": city_id} if city_id else {}
+            with httpx.Client(timeout=self.timeout) as c:
+                r = c.get(f"{self.base}/setup/areas",
+                          params=params, headers=self._headers())
+            return r.json()
+        except Exception as e:
+            return {"areas": [], "error": str(e)}
 
-    # Save batch record
-    supabase.table("upload_batches").insert({
-        "id":          batch_id,
-        "tenant_id":   tenant_id,
-        "filename":    filename,
-        "source_type": source_type,
-        "total_rows":  len(queue_rows),
-        "valid_rows":  valid_rows,
-        "invalid_rows":invalid_rows,
-        "status":      "validated",
-    }).execute()
+    def save_area(self, data):
+        try:
+            with httpx.Client(timeout=self.timeout) as c:
+                r = c.post(f"{self.base}/setup/areas",
+                           json=data, headers=self._headers())
+            return r.json()
+        except Exception as e:
+            return {"success": False, "error": str(e)}
 
-    # Save queue rows in chunks of 50
-    for i in range(0, len(queue_rows), 50):
-        chunk = queue_rows[i:i+50]
-        supabase.table("invoice_queue").insert(chunk).execute()
+    def get_bulk_invoices(self):
+        try:
+            with httpx.Client(timeout=self.timeout) as c:
+                r = c.get(f"{self.base}/bulk/invoices", headers=self._headers())
+            return r.json()
+        except Exception as e:
+            return {"invoices": [], "counts": {}, "error": str(e)}
 
-    return {
-        "batch_id":          batch_id,
-        "total":             len(queue_rows),
-        "valid":             valid_rows,
-        "invalid":           invalid_rows,
-        "customers_added":   cust_count,
-        "products_added":    prod_count,
-        "validation_summary": validation_summary,
-    }
+    def update_bulk_invoice(self, invoice_id, data):
+        try:
+            with httpx.Client(timeout=self.timeout) as c:
+                r = c.put(f"{self.base}/bulk/invoices/{invoice_id}",
+                          json=data, headers=self._headers())
+            return r.json()
+        except Exception as e:
+            return {"success": False, "error": str(e)}
 
+    def delete_bulk_invoice(self, invoice_id):
+        try:
+            with httpx.Client(timeout=self.timeout) as c:
+                r = c.delete(f"{self.base}/bulk/invoices/{invoice_id}",
+                             headers=self._headers())
+            return r.json()
+        except Exception as e:
+            return {"success": False, "error": str(e)}
 
-# ── Submit confirmed batch to FBR ─────────────────────────────────────────────
+    def delete_bulk_invoices(self, ids: list):
+        results = []
+        for inv_id in ids:
+            results.append(self.delete_bulk_invoice(inv_id))
+        return {"deleted": len([r for r in results if r.get("success")])}
 
-async def submit_batch(batch_id: str, tenant_id: str) -> dict:
-    """
-    Submit all valid queued rows to FBR one by one.
-    Called after user confirms.
-    """
-    tenant = get_tenant(tenant_id)
-    if not tenant:
-        return {"error": "Tenant not found"}
-
-    fbr_token = tenant.get("fbr_bearer_token", "")
-
-    # Get all valid rows for this batch
-    rows = supabase.table("invoice_queue").select("*").eq(
-        "batch_id", batch_id
-    ).eq("status", "valid").execute()
-
-    if not rows.data:
-        return {"error": "No valid rows found", "submitted": 0}
-
-    # Update batch status
-    supabase.table("upload_batches").update({
-        "status": "processing"
-    }).eq("id", batch_id).execute()
-
-    submitted = 0
-    failed    = 0
-
-    for row in rows.data:
-        # Mark as submitting
-        supabase.table("invoice_queue").update({
-            "status":   "submitting",
-            "attempts": row["attempts"] + 1,
-        }).eq("id", row["id"]).execute()
-
-        payload = row["invoice_payload"]
-        result  = await post_invoice_to_fbr(payload)
-
-        if result["success"]:
-            supabase.table("invoice_queue").update({
-                "status":       "submitted",
-                "tracking_no":  result.get("invoice_no"),
-                "fbr_response": result["raw"],
-                "submitted_at": datetime.utcnow().isoformat(),
-                "error_msg":    None,
-            }).eq("id", row["id"]).execute()
-            submitted += 1
-        else:
-            attempts = row["attempts"] + 1
-            supabase.table("invoice_queue").update({
-                "status":    "retry" if attempts < 3 else "failed",
-                "error_msg": result["error"],
-                "fbr_response": result["raw"],
-            }).eq("id", row["id"]).execute()
-            failed += 1
-
-    # Update batch complete
-    final_status = "complete" if failed == 0 else "partial"
-    supabase.table("upload_batches").update({
-        "status":       final_status,
-        "submitted":    submitted,
-        "failed":       failed,
-        "completed_at": datetime.utcnow().isoformat(),
-    }).eq("id", batch_id).execute()
-
-    return {
-        "batch_id":  batch_id,
-        "submitted": submitted,
-        "failed":    failed,
-        "status":    final_status,
-    }
+    def submit_selected_invoices(self, ids: list):
+        try:
+            with httpx.Client(timeout=120.0) as c:
+                r = c.post(f"{self.base}/bulk/invoices/submit-selected",
+                           json={"ids": ids}, headers=self._headers())
+            return r.json()
+        except Exception as e:
+            return {"submitted": 0, "failed": len(ids), "error": str(e)}
