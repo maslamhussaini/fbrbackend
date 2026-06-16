@@ -1,3 +1,4 @@
+#bulk_processor.py
 import openpyxl
 from io import BytesIO
 import uuid
@@ -510,7 +511,7 @@ def create_batch(filename: str, source_type: str, tenant_id: str,
             "batch_id":          batch_id,
             "row_number":        row_num,
             "source_type":       source_type,
-            "raw_data":          row_data,
+            "raw_data":          _json_safe(row_data),
             "invoice_payload":   payload,
             "status":            status,
             "validation_errors": errors,
