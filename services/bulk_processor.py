@@ -83,7 +83,6 @@ def get_tenant(tenant_id: str) -> Optional[dict]:
         logger.warning(f"Tenant lookup failed: {e}")
         return None
 
-
 # ── Build FBR payload from queue row ─────────────────────────────────────────
 
 def build_payload_from_row(row_data: dict, tenant: dict, tenant_id: str) -> tuple[dict, list]:
