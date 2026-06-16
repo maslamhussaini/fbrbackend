@@ -35,42 +35,53 @@ def detect_scenario(registration_status: str, sale_type: str = "") -> str:
 
 def get_customer(tenant_id: str, ntn_or_name: str) -> Optional[dict]:
     """Look up customer by NTN/CNIC or name."""
-    result = supabase.table("customers").select("*").eq(
-        "tenant_id", tenant_id
-    ).eq("ntn_cnic", str(ntn_or_name)).execute()
-    if result.data:
-        return result.data[0]
+    if not ntn_or_name or str(ntn_or_name).lower() in ("unregistered", "0000000", "", "none"):
+        return None
+    try:
+        result = supabase.table("customers").select("*").eq(
+            "tenant_id", tenant_id
+        ).eq("ntn_cnic", str(ntn_or_name)).execute()
+        if result.data:
+            return result.data[0]
 
-    result = supabase.table("customers").select("*").eq(
-        "tenant_id", tenant_id
-    ).ilike("name", f"%{ntn_or_name}%").execute()
-    if result.data:
-        return result.data[0]
+        result = supabase.table("customers").select("*").eq(
+            "tenant_id", tenant_id
+        ).ilike("name", f"%{ntn_or_name}%").execute()
+        if result.data:
+            return result.data[0]
+    except Exception as e:
+        logger.warning(f"Customer lookup failed for '{ntn_or_name}': {e}")
 
-    # Fallback to UNREGISTERED
-    result = supabase.table("customers").select("*").eq(
-        "tenant_id", tenant_id
-    ).eq("name", "UNREGISTERED").execute()
-    return result.data[0] if result.data else None
+    return None
 
 
 def get_product(tenant_id: str, hs_code_or_code: str) -> Optional[dict]:
     """Look up product by HS code or product code."""
-    result = supabase.table("products").select("*").eq(
-        "tenant_id", tenant_id
-    ).eq("hs_code", str(hs_code_or_code)).execute()
-    if result.data:
-        return result.data[0]
+    if not hs_code_or_code:
+        return None
+    try:
+        result = supabase.table("products").select("*").eq(
+            "tenant_id", tenant_id
+        ).eq("hs_code", str(hs_code_or_code)).execute()
+        if result.data:
+            return result.data[0]
 
-    result = supabase.table("products").select("*").eq(
-        "tenant_id", tenant_id
-    ).eq("product_code", str(hs_code_or_code)).execute()
-    return result.data[0] if result.data else None
+        result = supabase.table("products").select("*").eq(
+            "tenant_id", tenant_id
+        ).eq("product_code", str(hs_code_or_code)).execute()
+        return result.data[0] if result.data else None
+    except Exception as e:
+        logger.warning(f"Product lookup failed for '{hs_code_or_code}': {e}")
+        return None
 
 
 def get_tenant(tenant_id: str) -> Optional[dict]:
-    result = supabase.table("tenants").select("*").eq("id", tenant_id).single().execute()
-    return result.data
+    try:
+        result = supabase.table("tenants").select("*").eq("id", tenant_id).execute()
+        return result.data[0] if result.data else None
+    except Exception as e:
+        logger.warning(f"Tenant lookup failed: {e}")
+        return None
 
 
 # ── Build FBR payload from queue row ─────────────────────────────────────────
