@@ -80,8 +80,9 @@ def build_payload_from_row(row_data: dict, tenant: dict, tenant_id: str) -> tupl
     """
     errors = []
 
-    # ── Normalize column names — map template headers to internal keys ────────
+    # ── Normalize column names — map ANY format to internal keys ────────────
     ALIASES = {
+        # Template format
         "invoice date":           "invoice_date",
         "invoice ref no":         "invoice_ref_no",
         "buyer ntn/cnic":         "buyer_ntn",
@@ -96,14 +97,50 @@ def build_payload_from_row(row_data: dict, tenant: dict, tenant_id: str) -> tupl
         "quantity":               "quantity",
         "value excl st":          "value_excl_st",
         "sales tax":              "sales_tax",
-        "rate":                   "rate",
+        "rate":                   "gst_rate",
         "sale type":              "sale_type",
         "sro schedule no":        "sro_schedule_no",
         "sro item serial no":     "sro_item_serial",
         "further tax":            "further_tax_amt",
         "retail price":           "retail_price",
+        # Business Box export format
+        "buyer ntn":              "buyer_ntn",
+        "buyer cnic":             "buyer_ntn",
+        "buyer type":             "buyer_registration_type",
+        "document type":          "doc_type",
+        "document number":        "invoice_ref_no",
+        "document date":          "invoice_date",
+        "description":            "description_raw",
+        "value of sales excluding sales tax": "value_excl_st",
+        "fixed / notified value or retail price": "retail_price",
+        "sales tax/ fed in st mode": "sales_tax",
+        "rate.1":                 "unit_rate",
+        "sro no. / schedule no.": "sro_schedule_no",
+        "item sr. no.":           "sro_item_serial",
+        "total value of sales":   "total_value",
+        "sr.":                    "_row_number",
     }
     row_data = {ALIASES.get(k, k): v for k, v in row_data.items()}
+
+    # ── Split Description "6309 - Textiles worn clothing..." → HS + desc ──
+    desc_raw = str(row_data.get("description_raw") or "")
+    if desc_raw and " - " in desc_raw and not row_data.get("hs_code"):
+        parts = desc_raw.split(" - ", 1)
+        row_data["hs_code"]             = parts[0].strip()
+        row_data["product_description"] = parts[1].strip() if len(parts) > 1 else desc_raw
+    elif desc_raw and not row_data.get("product_description"):
+        row_data["product_description"] = desc_raw
+
+    # ── Handle datetime objects for dates ──────────────────────────────────
+    inv_date = row_data.get("invoice_date")
+    if inv_date and hasattr(inv_date, "strftime"):
+        row_data["invoice_date"] = inv_date.strftime("%Y-%m-%d")
+    elif inv_date:
+        row_data["invoice_date"] = str(inv_date)
+
+    # ── Use gst_rate if rate wasn't mapped to sales_tax ───────────────────
+    if not row_data.get("gst_rate"):
+        row_data["gst_rate"] = 18  # default GST
 
     # Resolve customer
     buyer_id = row_data.get("buyer_ntn") or row_data.get("buyer_name") or ""
@@ -145,7 +182,7 @@ def build_payload_from_row(row_data: dict, tenant: dict, tenant_id: str) -> tupl
             mrp        = float(product.get("mrp") or 0)
             tax_pct    = float(product.get("sales_tax_pct") or 18)
         else:
-            rate       = str(item.get("rate", "18%"))
+            rate       = str(item.get("gst_rate") or item.get("rate", "18"))
             uom        = str(item.get("uom") or item.get("uoM", "KG"))
             sale_type  = item.get("sale_type") or item.get("saleType",
                          "Goods at standard rate (default)")
@@ -154,12 +191,18 @@ def build_payload_from_row(row_data: dict, tenant: dict, tenant_id: str) -> tupl
             fed        = float(item.get("fed_payable") or 0)
             mrp        = float(item.get("retail_price") or
                                item.get("fixedNotifiedValueOrRetailPrice") or 0)
-            tax_pct    = 18
+            try:
+                tax_pct = float(str(rate).replace("%",""))
+            except (ValueError, TypeError):
+                tax_pct = 18
 
         qty          = float(item.get("quantity") or 0)
         value_excl   = float(item.get("value_excl_st") or
                              item.get("valueSalesExcludingST") or 0)
-        sales_tax    = round(value_excl * tax_pct / 100, 2)
+        # Use pre-calculated sales tax if available, otherwise compute
+        sales_tax    = float(item.get("sales_tax") or 0)
+        if not sales_tax and value_excl:
+            sales_tax = round(value_excl * tax_pct / 100, 2)
         total        = round(value_excl + sales_tax, 2)
         ft           = round(value_excl * further_tax, 2) if further_tax else 0
 
@@ -260,8 +303,19 @@ def parse_bulk_excel(file_bytes: bytes) -> dict:
         rows_out = []
         if not ws:
             return rows_out
-        headers = [str(c.value or "").strip().lower()
-                   for c in next(ws.iter_rows(min_row=1, max_row=1))]
+        # Handle duplicate headers by appending .1, .2 etc
+        raw_headers = [str(c.value or "").strip().lower()
+                       for c in next(ws.iter_rows(min_row=1, max_row=1))]
+        headers = []
+        seen = {}
+        for h in raw_headers:
+            if h in seen:
+                seen[h] += 1
+                headers.append(f"{h}.{seen[h]}")
+            else:
+                seen[h] = 0
+                headers.append(h)
+
         for row_idx, row in enumerate(ws.iter_rows(min_row=2, values_only=True), 2):
             if not any(row):
                 continue
@@ -274,8 +328,18 @@ def parse_bulk_excel(file_bytes: bytes) -> dict:
         rows_out = []
         if not ws:
             return rows_out
-        headers = [str(c.value or "").strip().lower()
-                   for c in next(ws.iter_rows(min_row=1, max_row=1))]
+        raw_headers = [str(c.value or "").strip().lower()
+                       for c in next(ws.iter_rows(min_row=1, max_row=1))]
+        headers = []
+        seen = {}
+        for h in raw_headers:
+            if h in seen:
+                seen[h] += 1
+                headers.append(f"{h}.{seen[h]}")
+            else:
+                seen[h] = 0
+                headers.append(h)
+
         for row in ws.iter_rows(min_row=2, values_only=True):
             if not any(row):
                 continue
