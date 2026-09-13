@@ -23,9 +23,14 @@ def _json_safe(obj):
         return obj
     return str(obj)
 
-TEST_TENANT_ID = "00000000-0000-0000-0000-000000000001"
-
-# ── Scenario auto-detection ───────────────────────────────────────────────────
+def get_tenant(tenant_id: str) -> Optional[dict]:
+    try:
+        result = supabase.table("fbr_tbl_tenants").select("*").eq("id", tenant_id).execute()
+        if result.data:
+            return result.data[0]
+    except Exception as e:
+        logger.warning(f"Tenant lookup failed: {e}")
+    return None
 
 def detect_scenario(registration_status: str, sale_type: str = "") -> str:
     """Auto-detect FBR scenario from customer registration status."""
@@ -51,13 +56,13 @@ def get_customer(tenant_id: str, ntn_or_name: str) -> Optional[dict]:
     if not ntn_or_name or str(ntn_or_name).lower() in ("unregistered", "0000000", "", "none"):
         return None
     try:
-        result = supabase.table("customers").select("*").eq(
+        result = supabase.table("fbr_tbl_customers").select("*").eq(
             "tenant_id", tenant_id
         ).eq("ntn_cnic", str(ntn_or_name)).execute()
         if result.data:
             return result.data[0]
 
-        result = supabase.table("customers").select("*").eq(
+        result = supabase.table("fbr_tbl_customers").select("*").eq(
             "tenant_id", tenant_id
         ).ilike("name", f"%{ntn_or_name}%").execute()
         if result.data:
@@ -73,13 +78,13 @@ def get_product(tenant_id: str, hs_code_or_code: str) -> Optional[dict]:
     if not hs_code_or_code:
         return None
     try:
-        result = supabase.table("products").select("*").eq(
+        result = supabase.table("fbr_tbl_products").select("*").eq(
             "tenant_id", tenant_id
         ).eq("hs_code", str(hs_code_or_code)).execute()
         if result.data:
             return result.data[0]
 
-        result = supabase.table("products").select("*").eq(
+        result = supabase.table("fbr_tbl_products").select("*").eq(
             "tenant_id", tenant_id
         ).eq("product_code", str(hs_code_or_code)).execute()
         return result.data[0] if result.data else None
@@ -87,24 +92,7 @@ def get_product(tenant_id: str, hs_code_or_code: str) -> Optional[dict]:
         logger.warning(f"Product lookup failed for '{hs_code_or_code}': {e}")
         return None
 
-FALLBACK_TENANT = {
-    "id": "00000000-0000-0000-0000-000000000001",
-    "name": "FAIZAN ENGINEERING SERVICES",
-    "ntn_cnic": "1234567-8",
-    "province": "SINDH",
-    "address": "PAKISTAN",
-    "plan": "free",
-}
-def get_tenant(tenant_id: str) -> Optional[dict]:
-    try:
-        result = supabase.table("tenants").select("*").eq("id", tenant_id).execute()
-        if result.data:
-            return result.data[0]
-    except Exception as e:
-        logger.warning(f"Tenant lookup failed: {e}")
-    if tenant_id == TEST_TENANT_ID:
-        return dict(FALLBACK_TENANT)
-    return None
+
 # ── Build FBR payload from queue row ─────────────────────────────────────────
 
 def build_payload_from_row(row_data: dict, tenant: dict, tenant_id: str) -> tuple[dict, list]:
@@ -443,7 +431,7 @@ def upsert_customers(customers: list, tenant_id: str) -> int:
             "further_tax_percent": float(c.get("further_tax_percent") or
                                          c.get("further tax %") or 0),
         }
-        supabase.table("customers").upsert(row, on_conflict="tenant_id,ntn_cnic").execute()
+        supabase.table("fbr_tbl_customers").upsert(row, on_conflict="tenant_id,ntn_cnic").execute()
         count += 1
     return count
 
@@ -468,7 +456,7 @@ def upsert_products(products: list, tenant_id: str) -> int:
             "fed_percent":     float(p.get("fed_percent") or 0),
             "mrp":             float(p.get("mrp") or 0),
         }
-        supabase.table("products").upsert(row, on_conflict="tenant_id,hs_code").execute()
+        supabase.table("fbr_tbl_products").upsert(row, on_conflict="tenant_id,hs_code").execute()
         count += 1
     return count
 
@@ -537,7 +525,7 @@ def create_batch(filename: str, source_type: str, tenant_id: str,
         })
 
     # Save batch record
-    supabase.table("upload_batches").insert({
+    supabase.table("fbr_tbl_upload_batches").insert({
         "id":          batch_id,
         "tenant_id":   tenant_id,
         "filename":    filename,
@@ -551,7 +539,7 @@ def create_batch(filename: str, source_type: str, tenant_id: str,
     # Save queue rows in chunks of 50
     for i in range(0, len(queue_rows), 50):
         chunk = queue_rows[i:i+50]
-        supabase.table("invoice_queue").insert(chunk).execute()
+        supabase.table("fbr_tbl_invoice_queue").insert(chunk).execute()
 
     return {
         "batch_id":          batch_id,
@@ -578,7 +566,7 @@ async def submit_batch(batch_id: str, tenant_id: str) -> dict:
     fbr_token = tenant.get("fbr_bearer_token", "")
 
     # Get all valid rows for this batch
-    rows = supabase.table("invoice_queue").select("*").eq(
+    rows = supabase.table("fbr_tbl_invoice_queue").select("*").eq(
         "batch_id", batch_id
     ).eq("status", "valid").execute()
 
@@ -586,7 +574,7 @@ async def submit_batch(batch_id: str, tenant_id: str) -> dict:
         return {"error": "No valid rows found", "submitted": 0}
 
     # Update batch status
-    supabase.table("upload_batches").update({
+    supabase.table("fbr_tbl_upload_batches").update({
         "status": "processing"
     }).eq("id", batch_id).execute()
 
@@ -595,16 +583,17 @@ async def submit_batch(batch_id: str, tenant_id: str) -> dict:
 
     for row in rows.data:
         # Mark as submitting
-        supabase.table("invoice_queue").update({
+        supabase.table("fbr_tbl_invoice_queue").update({
             "status":   "submitting",
             "attempts": row["attempts"] + 1,
         }).eq("id", row["id"]).execute()
 
         payload = row["invoice_payload"]
-        result  = await post_invoice_to_fbr(payload)
+        fbr_token = tenant.get("fbr_bearer_token", "")
+        result  = await post_invoice_to_fbr(payload, bearer_token=fbr_token)
 
         if result["success"]:
-            supabase.table("invoice_queue").update({
+            supabase.table("fbr_tbl_invoice_queue").update({
                 "status":       "submitted",
                 "tracking_no":  result.get("invoice_no"),
                 "fbr_response": result["raw"],
@@ -614,7 +603,7 @@ async def submit_batch(batch_id: str, tenant_id: str) -> dict:
             submitted += 1
         else:
             attempts = row["attempts"] + 1
-            supabase.table("invoice_queue").update({
+            supabase.table("fbr_tbl_invoice_queue").update({
                 "status":    "retry" if attempts < 3 else "failed",
                 "error_msg": result["error"],
                 "fbr_response": result["raw"],
@@ -623,7 +612,7 @@ async def submit_batch(batch_id: str, tenant_id: str) -> dict:
 
     # Update batch complete
     final_status = "complete" if failed == 0 else "partial"
-    supabase.table("upload_batches").update({
+    supabase.table("fbr_tbl_upload_batches").update({
         "status":       final_status,
         "submitted":    submitted,
         "failed":       failed,

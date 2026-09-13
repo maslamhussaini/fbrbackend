@@ -25,7 +25,7 @@ DEFAULTS = {
 def get_settings() -> dict:
     """Load scheduler settings from DB. Falls back to defaults on error."""
     try:
-        rows = supabase.table("scheduler_settings").select("key,value").execute()
+        rows = supabase.table("fbr_tbl_scheduler_settings").select("key,value").execute()
         cfg = dict(DEFAULTS)
         for row in (rows.data or []):
             k, v = row["key"], row["value"]
@@ -41,7 +41,7 @@ def get_settings() -> dict:
 
 def save_setting(key: str, value: str):
     """Update a single scheduler setting in DB."""
-    supabase.table("scheduler_settings").update({
+    supabase.table("fbr_tbl_scheduler_settings").update({
         "value":      str(value),
         "updated_at": datetime.utcnow().isoformat(),
     }).eq("key", key).execute()
@@ -55,7 +55,7 @@ async def _submit_queue_row(row: dict, max_attempts: int):
     row_id   = row["id"]
     attempts = row.get("attempts", 0) + 1
 
-    supabase.table("invoice_queue").update({
+    supabase.table("fbr_tbl_invoice_queue").update({
         "status":   "submitting",
         "attempts": attempts,
     }).eq("id", row_id).execute()
@@ -63,16 +63,23 @@ async def _submit_queue_row(row: dict, max_attempts: int):
     try:
         payload = row.get("invoice_payload")
         if not payload:
-            supabase.table("invoice_queue").update({
+            supabase.table("fbr_tbl_invoice_queue").update({
                 "status":    "invalid",
                 "error_msg": "No invoice payload found",
             }).eq("id", row_id).execute()
             return
 
-        result = await post_invoice_to_fbr(payload)
+        tenant_id = row.get("tenant_id")
+        fbr_token = ""
+        if tenant_id:
+            tenant_row = supabase.table("fbr_tbl_tenants").select("fbr_bearer_token").eq("id", tenant_id).single().execute()
+            if tenant_row.data:
+                fbr_token = tenant_row.data.get("fbr_bearer_token", "")
+
+        result = await post_invoice_to_fbr(payload, bearer_token=fbr_token)
 
         if result["success"]:
-            supabase.table("invoice_queue").update({
+            supabase.table("fbr_tbl_invoice_queue").update({
                 "status":       "submitted",
                 "tracking_no":  result.get("invoice_no"),
                 "fbr_response": result["raw"],
@@ -82,7 +89,7 @@ async def _submit_queue_row(row: dict, max_attempts: int):
             logger.info(f"[Scheduler] ✓ Row {row_id[:8]} → FBR #{result.get('invoice_no','')}")
         else:
             new_status = "retry" if attempts < max_attempts else "failed"
-            supabase.table("invoice_queue").update({
+            supabase.table("fbr_tbl_invoice_queue").update({
                 "status":       new_status,
                 "error_msg":    result.get("error","FBR error"),
                 "fbr_response": result.get("raw",{}),
@@ -91,7 +98,7 @@ async def _submit_queue_row(row: dict, max_attempts: int):
 
     except Exception as e:
         new_status = "retry" if attempts < max_attempts else "failed"
-        supabase.table("invoice_queue").update({
+        supabase.table("fbr_tbl_invoice_queue").update({
             "status":    new_status,
             "error_msg": str(e),
         }).eq("id", row_id).execute()
@@ -110,7 +117,7 @@ async def process_pending_queue():
     max_attempts = cfg["max_attempts"]
 
     try:
-        rows = supabase.table("invoice_queue").select("*").eq(
+        rows = supabase.table("fbr_tbl_invoice_queue").select("*").eq(
             "status", "queued"
         ).limit(batch_size).execute()
 
@@ -134,7 +141,7 @@ async def retry_failed_invoices():
     max_attempts = cfg["max_attempts"]
 
     try:
-        rows = supabase.table("invoice_queue").select("*").eq(
+        rows = supabase.table("fbr_tbl_invoice_queue").select("*").eq(
             "status", "retry"
         ).lt("attempts", max_attempts).limit(batch_size).execute()
 
@@ -155,12 +162,12 @@ async def health_check():
 
     try:
         # Move exhausted retries to manual_review
-        supabase.table("invoice_queue").update({
+        supabase.table("fbr_tbl_invoice_queue").update({
             "status":    "manual_review",
             "error_msg": f"Exceeded {max_attempts} attempts — manual review required"
         }).eq("status", "retry").gte("attempts", max_attempts).execute()
 
-        rows = supabase.table("invoice_queue").select("status").execute()
+        rows = supabase.table("fbr_tbl_invoice_queue").select("status").execute()
         counts: dict = {}
         for r in (rows.data or []):
             s = r["status"]

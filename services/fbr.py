@@ -52,21 +52,24 @@ SALE_TYPE_MAP = {
 
 # ── FBR API call ──────────────────────────────────────────────────────────────
 
-async def post_invoice_to_fbr(invoice_payload: dict, use_validate: bool = False) -> dict:
+async def post_invoice_to_fbr(invoice_payload: dict, use_validate: bool = False, bearer_token: str = "", raise_on_timeout: bool = False) -> dict:
     """
     Post invoice to FBR API.
     use_validate=True hits the validate endpoint (no actual submission).
+    bearer_token: optional per-tenant token; falls back to settings.FBR_BEARER_TOKEN.
+    raise_on_timeout: if True, re-raise httpx.TimeoutException instead of returning failure.
     Returns: { success: bool, invoice_no: str|None, error: str|None, raw: dict }
     """
     url = settings.FBR_VALIDATE_URL if use_validate else settings.FBR_URL
+    token = bearer_token or settings.FBR_BEARER_TOKEN
 
     headers = {
-        "Authorization": f"Bearer {settings.FBR_BEARER_TOKEN}",
+        "Authorization": f"Bearer {token}",
         "Content-Type": "application/json"
     }
 
     try:
-        async with httpx.AsyncClient(verify=False, timeout=30.0) as client:
+        async with httpx.AsyncClient(verify=True, timeout=30.0) as client:
             response = await client.post(url, json=invoice_payload, headers=headers)
 
         data = response.json()
@@ -102,6 +105,8 @@ async def post_invoice_to_fbr(invoice_payload: dict, use_validate: bool = False)
             }
 
     except httpx.TimeoutException:
+        if raise_on_timeout:
+            raise
         return {"success": False, "invoice_no": None,
                 "error": "FBR API timeout — will retry", "raw": {}}
     except Exception as e:
@@ -167,9 +172,9 @@ async def submit_invoice(invoice_id: str, validate_only: bool = False):
     """
     Fetch invoice from Supabase, post to FBR, update status.
     """
-    inv = supabase.table("invoices").select("*").eq("id", invoice_id).single().execute()
-    items = supabase.table("invoice_items").select("*").eq("invoice_id", invoice_id).execute()
-    tenant = supabase.table("tenants").select("*").eq("id", inv.data["tenant_id"]).single().execute()
+    inv = supabase.table("fbr_tbl_invoices").select("*").eq("id", invoice_id).single().execute()
+    items = supabase.table("fbr_tbl_invoice_items").select("*").eq("invoice_id", invoice_id).execute()
+    tenant = supabase.table("fbr_tbl_tenants").select("*").eq("id", inv.data["tenant_id"]).single().execute()
 
     if not inv.data:
         logger.error(f"Invoice {invoice_id} not found")
@@ -183,7 +188,8 @@ async def submit_invoice(invoice_id: str, validate_only: bool = False):
     }
 
     payload = build_fbr_payload(inv.data, items.data, seller)
-    result = await post_invoice_to_fbr(payload, use_validate=validate_only)
+    tenant_token = tenant.data.get("fbr_bearer_token", "") or settings.FBR_BEARER_TOKEN
+    result = await post_invoice_to_fbr(payload, use_validate=validate_only, bearer_token=tenant_token)
 
     if not validate_only:
         update = {
@@ -199,6 +205,6 @@ async def submit_invoice(invoice_id: str, validate_only: bool = False):
             update["status"] = "retry" if attempts < 3 else "failed"
             update["error_msg"] = result["error"]
 
-        supabase.table("invoices").update(update).eq("id", invoice_id).execute()
+        supabase.table("fbr_tbl_invoices").update(update).eq("id", invoice_id).execute()
 
     return result

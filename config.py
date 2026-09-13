@@ -15,6 +15,7 @@ class Settings(BaseSettings):
     # App
     APP_SECRET_KEY: str = "change-this-in-production"
     ENVIRONMENT: str = "development"
+    CORS_ORIGINS: str = "*"
 
     @property
     def FBR_URL(self) -> str:

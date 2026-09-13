@@ -1,13 +1,11 @@
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, HTTPException, Depends
 from pydantic import BaseModel
 from db.supabase import supabase
 from config import settings as app_settings
 import httpx
+from routes.auth import get_current_tenant
 
 router = APIRouter(prefix="/settings", tags=["settings"])
-
-# Test tenant ID — replace with real auth in production
-TEST_TENANT_ID = "00000000-0000-0000-0000-000000000001"
 
 
 class SettingsPayload(BaseModel):
@@ -25,18 +23,18 @@ class TokenTestPayload(BaseModel):
 
 # ── Get current settings ──────────────────────────────────────────────────────
 @router.get("")
-def get_settings():
+def get_settings(tenant_ctx: dict = Depends(get_current_tenant)):
     try:
-        result = supabase.table("tenants").select(
-            "id, name, ntn_cnic, province, address, fbr_bearer_token, plan"
-        ).eq("id", TEST_TENANT_ID).single().execute()
+        result = supabase.table("fbr_tbl_tenants").select(
+            "id, name, ntn_cnic, province, address, plan"
+        ).eq("id", tenant_ctx["tenant_id"]).single().execute()
 
         if not result.data:
             return {"success": False, "data": None}
 
-        # Add use_sandbox flag from app config
-        data = result.data
+        data = dict(result.data)
         data["use_sandbox"] = app_settings.FBR_USE_SANDBOX
+        data["fbr_token_configured"] = bool(data.get("fbr_bearer_token"))
 
         return {"success": True, "data": data}
     except Exception as e:
@@ -45,7 +43,7 @@ def get_settings():
 
 # ── Save settings ─────────────────────────────────────────────────────────────
 @router.post("")
-def save_settings(payload: SettingsPayload):
+def save_settings(payload: SettingsPayload, tenant_ctx: dict = Depends(get_current_tenant)):
     try:
         update = {
             "name":             payload.name,
@@ -56,14 +54,14 @@ def save_settings(payload: SettingsPayload):
         }
 
         # Update in Supabase
-        result = supabase.table("tenants").update(update).eq(
-            "id", TEST_TENANT_ID
+        result = supabase.table("fbr_tbl_tenants").update(update).eq(
+            "id", tenant_ctx["tenant_id"]
         ).execute()
 
         if not result.data:
             # Tenant doesn't exist yet — insert it
-            insert = {**update, "id": TEST_TENANT_ID, "plan": "starter"}
-            supabase.table("tenants").insert(insert).execute()
+            insert = {**update, "id": tenant_ctx["tenant_id"], "plan": "starter"}
+            supabase.table("fbr_tbl_tenants").insert(insert).execute()
 
         # Also update the .env file for the backend
         _update_env_file(payload.fbr_bearer_token, payload.use_sandbox)
@@ -75,7 +73,7 @@ def save_settings(payload: SettingsPayload):
 
 # ── Test FBR token ────────────────────────────────────────────────────────────
 @router.post("/test-token")
-async def test_token(payload: TokenTestPayload):
+async def test_token(payload: TokenTestPayload, tenant_ctx: dict = Depends(get_current_tenant)):
     """
     Hit FBR validate endpoint with a minimal test payload.
     Returns valid=True if FBR accepts the token.
@@ -121,7 +119,7 @@ async def test_token(payload: TokenTestPayload):
     }
 
     try:
-        async with httpx.AsyncClient(verify=False, timeout=20) as client:
+        async with httpx.AsyncClient(verify=True, timeout=20) as client:
             r = await client.post(
                 app_settings.FBR_VALIDATE_URL,
                 json=test_payload,

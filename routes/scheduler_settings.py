@@ -1,7 +1,8 @@
-from fastapi import APIRouter
+from fastapi import APIRouter, Depends
 from pydantic import BaseModel
 from db.supabase import supabase
 from services.scheduler import get_settings, save_setting, reload_scheduler_jobs, scheduler
+from routes.auth import get_current_tenant
 
 router = APIRouter(prefix="/scheduler", tags=["scheduler"])
 
@@ -12,10 +13,10 @@ class SettingUpdate(BaseModel):
 
 
 @router.get("/settings")
-def get_scheduler_settings():
+def get_scheduler_settings(tenant_ctx: dict = Depends(get_current_tenant)):
     """Get all scheduler settings with current values."""
     try:
-        rows = supabase.table("scheduler_settings").select("*").execute()
+        rows = supabase.table("fbr_tbl_scheduler_settings").select("*").execute()
         return {
             "settings": rows.data,
             "active":   get_settings(),
@@ -26,7 +27,7 @@ def get_scheduler_settings():
 
 
 @router.post("/settings")
-async def update_scheduler_setting(payload: SettingUpdate):
+async def update_scheduler_setting(payload: SettingUpdate, tenant_ctx: dict = Depends(get_current_tenant)):
     """Update a single setting and reload scheduler jobs."""
     try:
         save_setting(payload.key, payload.value)
@@ -39,7 +40,7 @@ async def update_scheduler_setting(payload: SettingUpdate):
 
 
 @router.post("/settings/bulk")
-async def update_all_settings(settings: dict):
+async def update_all_settings(settings: dict, tenant_ctx: dict = Depends(get_current_tenant)):
     """Update multiple settings at once."""
     try:
         for key, value in settings.items():
@@ -52,7 +53,7 @@ async def update_all_settings(settings: dict):
 
 
 @router.get("/status")
-def scheduler_status():
+def scheduler_status(tenant_ctx: dict = Depends(get_current_tenant)):
     """Current scheduler status and job info."""
     jobs = []
     if scheduler.running:
@@ -70,7 +71,7 @@ def scheduler_status():
 
 
 @router.post("/toggle")
-async def toggle_auto_process():
+async def toggle_auto_process(tenant_ctx: dict = Depends(get_current_tenant)):
     """Enable or disable auto processing."""
     cfg = get_settings()
     new_val = not cfg["auto_process"]

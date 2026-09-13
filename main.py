@@ -1,4 +1,5 @@
 import logging
+from datetime import datetime
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from contextlib import asynccontextmanager
@@ -23,11 +24,15 @@ async def lifespan(app: FastAPI):
     stop_scheduler()
 
 
+from config import settings as app_settings
+
 app = FastAPI(title="FBR Digital Invoicing API", version="3.0.0", lifespan=lifespan)
+
+cors_origins = [o.strip() for o in app_settings.CORS_ORIGINS.split(",") if o.strip()] or ["*"]
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=cors_origins,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -43,23 +48,24 @@ app.include_router(setup_router)
 
 
 @app.get("/")
+def root():
+    return {"service": "FBR Digital Invoicing API", "version": "3.0.0"}
+
+
+@app.get("/health")
 def health():
-    cfg = get_settings()
     return {
-        "status":    "ok",
-        "version":   "3.0.0",
-        "scheduler": "running" if scheduler.running else "stopped",
-        "config": {
-            "queue_interval": f"{cfg['process_queue_seconds']}s",
-            "auto_process":   cfg['auto_process'],
-        }
+        "status": "ok",
+        "service": "FBR Digital Invoicing API",
+        "version": "3.0.0",
+        "timestamp": datetime.utcnow().isoformat(),
     }
 
 
 @app.get("/queue/status")
 def queue_status():
     from db.supabase import supabase
-    rows = supabase.table("invoice_queue").select("status").execute()
+    rows = supabase.table("fbr_tbl_invoice_queue").select("status").execute()
     counts: dict = {}
     for r in (rows.data or []):
         s = r["status"]
