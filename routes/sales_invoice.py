@@ -365,7 +365,7 @@ async def submit_to_fbr(invoice_id: str, request: Request, tenant_ctx: dict = De
 def cancel_invoice(invoice_id: str, tenant_ctx: dict = Depends(get_current_tenant)):
     inv = supabase.table("fbr_tbl_invoices").select("publish_status").eq(
         "id", invoice_id
-    ).single().execute()
+    ).eq("tenant_id", tenant_ctx["tenant_id"]).single().execute()
     if not inv.data:
         raise HTTPException(404, "Invoice not found")
     if inv.data.get("publish_status") == "Close":
@@ -374,7 +374,7 @@ def cancel_invoice(invoice_id: str, tenant_ctx: dict = Depends(get_current_tenan
     supabase.table("fbr_tbl_invoices").update({
         "publish_status": "Cancel",
         "status":         "cancelled"
-    }).eq("id", invoice_id).execute()
+    }).eq("id", invoice_id).eq("tenant_id", tenant_ctx["tenant_id"]).execute()
     return {"success": True}
 
 

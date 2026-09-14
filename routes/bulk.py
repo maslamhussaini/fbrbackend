@@ -347,7 +347,7 @@ async def submit_selected_invoices(data: dict, tenant_ctx: dict = Depends(get_cu
     for inv_id in ids:
         row = supabase.table("fbr_tbl_invoice_queue").select("*").eq(
             "id", inv_id
-        ).single().execute()
+        ).eq("tenant_id", tenant_ctx["tenant_id"]).single().execute()
 
         if not row.data:
             continue
@@ -357,7 +357,7 @@ async def submit_selected_invoices(data: dict, tenant_ctx: dict = Depends(get_cu
 
         supabase.table("fbr_tbl_invoice_queue").update({
             "status": "submitting", "attempts": attempts
-        }).eq("id", inv_id).execute()
+        }).eq("id", inv_id).eq("tenant_id", tenant_ctx["tenant_id"]).execute()
 
         tenant = supabase.table("fbr_tbl_tenants").select("*").eq(
             "id", tenant_ctx["tenant_id"]
@@ -372,13 +372,13 @@ async def submit_selected_invoices(data: dict, tenant_ctx: dict = Depends(get_cu
                 "fbr_response": result["raw"],
                 "error_msg":    None,
                 "submitted_at": datetime.utcnow().isoformat(),
-            }).eq("id", inv_id).execute()
+            }).eq("id", inv_id).eq("tenant_id", tenant_ctx["tenant_id"]).execute()
             results["submitted"] += 1
         else:
             supabase.table("fbr_tbl_invoice_queue").update({
                 "status":    "failed",
                 "error_msg": result.get("error",""),
-            }).eq("id", inv_id).execute()
+            }).eq("id", inv_id).eq("tenant_id", tenant_ctx["tenant_id"]).execute()
             results["failed"] += 1
             results["errors"].append(result.get("error",""))
 

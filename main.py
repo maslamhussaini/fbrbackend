@@ -28,7 +28,7 @@ from config import settings as app_settings
 
 app = FastAPI(title="FBR Digital Invoicing API", version="3.0.0", lifespan=lifespan)
 
-cors_origins = [o.strip() for o in app_settings.CORS_ORIGINS.split(",") if o.strip()] or ["*"]
+cors_origins = [o.strip() for o in app_settings.CORS_ORIGINS.split(",") if o.strip()]
 
 app.add_middleware(
     CORSMiddleware,

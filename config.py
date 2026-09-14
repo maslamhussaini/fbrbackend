@@ -15,7 +15,8 @@ class Settings(BaseSettings):
     # App
     APP_SECRET_KEY: str = "change-this-in-production"
     ENVIRONMENT: str = "development"
-    CORS_ORIGINS: str = "*"
+    # CORS — explicit comma-separated origins. Defaults are dev-only.
+    CORS_ORIGINS: str = "http://localhost:3000,http://localhost:8080,http://localhost:5173"
 
     @property
     def FBR_URL(self) -> str:
